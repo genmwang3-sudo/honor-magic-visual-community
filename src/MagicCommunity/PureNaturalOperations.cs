@@ -36,6 +36,12 @@ internal sealed class WindowsPureNaturalActions : IPureNaturalActions
     public ServiceReceipt StopService(string name)
     {
         string before = QueryServiceState(name);
+        // Prefer the LocalSystem service so stopping SysMain/whesvc does not
+        // require the desktop to hold an administrator token.
+        var serviced = MemoryServiceClient.StopService(name);
+        if (serviced is { } receipt)
+            return new ServiceReceipt(receipt.Name, receipt.Before != receipt.After,
+                receipt.BeforeText, receipt.AfterText, receipt.Stopped ? 0 : (int)receipt.Win32Error);
         var (exit, _) = Run(Path.Combine(systemDirectory, "sc.exe"), ["stop", name], 30000);
         string after = QueryServiceState(name);
         return new ServiceReceipt(name, before != after, before, after, exit);

@@ -17,6 +17,7 @@ internal sealed class PureNaturalScheduler : IDisposable
     private readonly PureNaturalPolicy policy;
     private readonly Func<long> now;
     private readonly Func<CleanResult> clean;
+    private readonly Func<MemoryServiceReceipt?> serviceClean;
     private readonly Func<IReadOnlyList<int>> children;
     private readonly Func<int, bool> suspend;
     private readonly Func<int, bool> resume;
@@ -27,8 +28,10 @@ internal sealed class PureNaturalScheduler : IDisposable
     private int cleaning, freezing, disposed;
 
     private PureNaturalScheduler(PureNaturalPolicy policy, Func<long> now, Func<CleanResult> clean,
-        Func<IReadOnlyList<int>> children, Func<int, bool> suspend, Func<int, bool> resume, Action<string, object> log)
+        Func<IReadOnlyList<int>> children, Func<int, bool> suspend, Func<int, bool> resume, Action<string, object> log,
+        Func<MemoryServiceReceipt?> serviceClean)
     {
+        this.serviceClean = serviceClean;
         this.policy = policy;
         this.now = now;
         this.clean = clean;
@@ -40,7 +43,8 @@ internal sealed class PureNaturalScheduler : IDisposable
 
     internal static PureNaturalScheduler? Start(PureNaturalPolicy policy, Action<string, object> log,
         Func<long>? clock = null, Func<CleanResult>? clean = null, Func<IReadOnlyList<int>>? children = null,
-        Func<int, bool>? suspend = null, Func<int, bool>? resume = null)
+        Func<int, bool>? suspend = null, Func<int, bool>? resume = null,
+        Func<MemoryServiceReceipt?>? serviceClean = null)
     {
         bool disabled = Environment.GetEnvironmentVariable(DisableVariable) == "1";
         bool any = policy.SystemMemoryClean || policy.OwnedProcessFreeze;
@@ -54,7 +58,8 @@ internal sealed class PureNaturalScheduler : IDisposable
             children ?? (() => PureNaturalNative.Children(Environment.ProcessId)),
             suspend ?? PureNaturalNative.Suspend,
             resume ?? PureNaturalNative.Resume,
-            log);
+            log,
+            serviceClean ?? MemoryServiceClient.Clean);
         int parent = Environment.ProcessId;
         if (policy.SystemMemoryClean)
             scheduler.timers.Add(new Timer(_ => scheduler.CleanTick(), null, policy.SystemCleanIntervalMs, policy.SystemCleanIntervalMs));
@@ -67,7 +72,9 @@ internal sealed class PureNaturalScheduler : IDisposable
             systemCleanIntervalMs = policy.SystemCleanIntervalMs,
             ownedFreeze = policy.OwnedProcessFreeze,
             ownedFreezeIntervalMs = policy.OwnedFreezeIntervalMs,
-            explicitPids = policy.FreezePids
+            explicitPids = policy.FreezePids,
+            memoryServiceInstalled = MemoryServiceClient.Installed(),
+            memoryServiceHealthy = MemoryServiceClient.Installed() && MemoryServiceClient.Healthy()
         });
         return scheduler;
     }
@@ -83,11 +90,30 @@ internal sealed class PureNaturalScheduler : IDisposable
             long tick = now();
             long previous = Interlocked.Read(ref lastClean);
             if (previous != Never && tick - previous < policy.SystemCleanIntervalMs) return;
+            // Prefer the LocalSystem service so the desktop keeps its normal
+            // token; fall back to the in-process call when the service is absent.
+            var serviced = serviceClean();
+            if (serviced is { } receipt)
+            {
+                Interlocked.Exchange(ref lastClean, tick);
+                log("pure_natural_clean", new
+                {
+                    trigger = "schedule",
+                    source = "service",
+                    purgeStatus = Hex(receipt.PurgeStatus),
+                    emptyWorkingSetsStatus = Hex(receipt.EmptyStatus),
+                    availableDeltaBytes = receipt.AvailableDeltaBytes,
+                    privilegeNotHeld = receipt.PrivilegeNotHeld,
+                    effective = receipt.Effective
+                });
+                return;
+            }
             var result = clean();
             Interlocked.Exchange(ref lastClean, tick);
             log("pure_natural_clean", new
             {
                 trigger = "schedule",
+                source = "in-process",
                 purgeStatus = Hex(result.PurgeStatus),
                 emptyWorkingSetsStatus = Hex(result.EmptyWorkingSetsStatus),
                 availableDeltaBytes = result.AvailableDeltaBytes,

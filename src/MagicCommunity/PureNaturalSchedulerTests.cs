@@ -31,7 +31,7 @@ internal static class PureNaturalSchedulerTests
             var policy = new PureNaturalPolicy { SystemMemoryClean = true, SystemCleanIntervalMs = 60_000 };
             using var scheduler = PureNaturalScheduler.Start(policy, Log, () => now,
                 () => { cleans++; return new CleanResult(true, new MemorySample(1, 100), new MemorySample(1, 200), [], 0, 0); },
-                () => [], _ => true, _ => true)!;
+                () => [], _ => true, _ => true, () => null)!;
             scheduler.CleanTick();
             Expect(cleans == 1, "first scheduled clean skipped");
             scheduler.CleanTick();
@@ -70,7 +70,7 @@ internal static class PureNaturalSchedulerTests
             long now = 0L;
             var policy = new PureNaturalPolicy { SystemMemoryClean = true, SystemCleanIntervalMs = 60_000 };
             using var scheduler = PureNaturalScheduler.Start(policy, Log, () => now,
-                () => throw new IOException("boom"), () => [], _ => true, _ => true)!;
+                () => throw new IOException("boom"), () => [], _ => true, _ => true, () => null)!;
             scheduler.CleanTick();
             Expect(logs.Contains("pure_natural_clean_failed"), "failure was not logged");
         });
