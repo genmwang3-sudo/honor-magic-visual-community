@@ -186,3 +186,31 @@ pwsh -NoProfile -File tools/dev/run-pure-natural-elevated.ps1 -NativeBackend art
 | `check-worktree.ps1` | `exitCode=0`，12 项测试全部 `allPass=true` |
 
 P3 的停服务需要管理员令牌；非管理员下按设计返回结构化拒绝，不做隐式提权。
+
+## 官方提权架构与社区版差异
+
+官方 `Launcher.exe`（SHA-256 `FFA227D95D0F3E7C0D8C1BDC19F7604169E23C25EB85892DECF2C6C1694A38E8`）保留完整符号，可直接读出服务创建与提权路径：
+
+```text
+OpenSCManagerW / CreateServiceW / CreateAndStartService(bool)
+StartServiceWithRetry(struct SC_HANDLE__ *)
+StopMagicAnimationService / DeleteMagicAnimationService
+CreateGuardService / StopGuardService / DeleteGuardService
+RunMagicVisualsAsAdmin(const wchar_t *)
+sc.exe sdset MagicAnimationService D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)
+```
+
+`SY`=LocalSystem、`BA`=Builtin Administrators。官方把内存清理、停服务、驱动 IOCTL 交给以 LocalSystem 运行的 `MagicAnimationService`，UI 保持普通完整性，日常启动不触发 UAC；另有 `GuardService` 与 `MonProcessControl.sys`。
+
+社区版没有服务层，两个特权只能在调用进程令牌里启用，因此：
+
+| 能力 | 官方 | 社区版 |
+| --- | --- | --- |
+| 特权承载 | LocalSystem 服务 | UI 进程整体提权 |
+| 日常是否触发 UAC | 否 | 是 |
+| 权限边界 | UI 普通完整性 + IPC | 全进程完整令牌 |
+| 内核管控 | `MonProcessControl.sys` | 未实现 |
+
+实测（管理员令牌，两次独立运行）：可用物理内存分别增加 `4490.4 MiB` 与 `3525.0 MiB`，命令 4/2 均返回 `0x00000000`，`privilegeNotHeld=false`。自动调度回执 `enabled=true, systemCleanIntervalMs=900000`，周期 15 分钟。
+
+结论：数值效果可复现，权限架构不等价。要达到官方形态需新增 LocalSystem 服务并在 UI 与服务之间加 IPC，这部分尚未实现。

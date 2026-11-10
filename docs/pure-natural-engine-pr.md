@@ -115,6 +115,90 @@ git -c core.whitespace=cr-at-eol diff --check
 - P3/P4 apply 路径的真实服务停启、驱动、黑名单、Junction 与目录迁移。
 - P1 生效依赖高完整性令牌；普通权限下仅返回结构化 `STATUS_PRIVILEGE_NOT_HELD`，不做隐式提权。
 
+## 官方提权路径 vs 社区版现状（重要差异）
+
+这一节回答审阅者最可能问的问题：**官方为什么能让内存清理默认生效，而社区版必须让用户以管理员身份启动？**
+
+### 官方：常驻 LocalSystem 服务，UI 不持有特权
+
+`Launcher.exe`（SHA-256 `FFA227D95D0F3E7C0D8C1BDC19F7604169E23C25EB85892DECF2C6C1694A38E8`）保留完整符号与字符串，证据如下：
+
+```text
+OpenSCManagerW
+CreateServiceW
+CreateAndStartService(bool)
+StartServiceWithRetry(struct SC_HANDLE__ *)
+StopMagicAnimationService / DeleteMagicAnimationService
+CreateGuardService / StopGuardService / DeleteGuardService
+RunMagicVisualsAsAdmin(const wchar_t *)
+ShellExecute ret:
+```
+
+服务安全描述符以明文写在二进制里：
+
+```text
+sc.exe sdset MagicAnimationService D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)
+                                    (A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)
+                                    (A;;CCLCSWRPLOCRRC;;;IU)
+                                    (A;;CCLCSWLOCRRC;;;SU)
+```
+
+`SY` 是 LocalSystem，`BA` 是 Builtin Administrators。也就是说：
+
+- 首次安装时创建 `MagicAnimationService`，运行身份是 LocalSystem；
+- UI（`MagicVisuals.exe` 等）保持普通用户完整性；
+- 内存清理、停服务、驱动 IOCTL 等特权动作通过 IPC 交给服务执行；
+- 另有 `GuardService` 做守护，`MonProcessControl.sys` 做内核级进程管控；
+- `RunMagicVisualsAsAdmin` 只用于少数需要完整管理员的场合，不是常态路径。
+
+结论：官方是**服务化最小权限**，用户日常启动不触发 UAC。
+
+### 社区版：没有服务，P1 只能整体提权
+
+社区版没有任何 LocalSystem 服务或内核驱动，因此特权的两个 Native API 只能在调用进程自己的令牌里启用。结果是：
+
+- 普通启动：`NtSetSystemInformation` 返回 `0xC0000061`，不释放内存，仅记录结构化回执；
+- 管理员启动：`SeIncreaseQuotaPrivilege` / `SeProfileSingleProcessPrivilege` 启用成功，命令 4/2 返回 `0x00000000`，内存真正释放。
+
+为了让 P1 自动调度可用，安装目录额外提供 `启动 Magic 视界（管理员）.cmd`，桌面快捷方式指向它。这是**降级方案**：整个桌面进程持有完整管理员令牌，隔离性弱于官方的服务模型。
+
+### 差异对照
+
+| 能力 | 官方 | 社区版 |
+| --- | --- | --- |
+| 特权承载 | LocalSystem 服务 `MagicAnimationService` | 无服务，UI 进程整体提权 |
+| 用户日常是否触发 UAC | 否 | 是 |
+| 权限边界 | UI 普通完整性，特权动作走 IPC | 全进程完整令牌 |
+| 守护 | `GuardService` 独立服务 | `MagicDesktopGuard.exe`（非服务） |
+| 内核管控 | `MonProcessControl.sys`（KMDF，按需启动） | 未实现 |
+| 运行时分发 | 自带 `DotNet8RuntimeUpdateInstaller` | 安装包内置 .NET 10.0.14 |
+
+### 实测数据（管理员令牌）
+
+| 轮次 | 清理前可用 | 清理后可用 | 增量 | PurgeStatus | EmptyWorkingSetsStatus |
+| --- | ---: | ---: | ---: | --- | --- |
+| 第一次 | 16.41 GiB | 20.79 GiB | **+4490.4 MiB** | `0x00000000` | `0x00000000` |
+| 第二次 | 20.66 GiB | 24.10 GiB | **+3525.0 MiB** | `0x00000000` | `0x00000000` |
+
+两次 `privilegeNotHeld=false`、`effective=true`。自动调度回执：
+
+```json
+{"name":"pure_natural_schedule","value":{
+  "enabled":true,"systemClean":true,"systemCleanIntervalMs":900000,
+  "ownedFreeze":false,"explicitPids":[]}}
+```
+
+调度周期 15 分钟，管理员启动后自动生效。
+
+### 这一节要传达的判断
+
+社区版的低内存效果**在数值上可复现**（单次清理 3–4.4 GiB），但**在权限架构上不等价**于官方：
+
+- 官方把特权收进 LocalSystem 服务，用户无感；
+- 社区版把特权留在 UI 进程，用户必须接受 UAC。
+
+要做成官方那种形态，需要新增一个 LocalSystem 服务承载 P1/P3，并把 UI 改成通过 IPC 请求特权动作。这部分尚未实现，也不在本 PR 声称的范围内。
+
 ## 提交
 
 - `b93e766 feat(memory): port pure natural memory governance`（17 files, +1901 / -6）
