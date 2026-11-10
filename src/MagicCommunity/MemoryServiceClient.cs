@@ -37,6 +37,9 @@ internal readonly record struct ServiceStopReceipt(string Name, uint Before, uin
     internal string AfterText => Describe(After);
 }
 
+internal readonly record struct FolderMigrateReceipt(string Folder, bool Moved, bool Junctioned,
+    bool RolledBack, uint Win32Error, string Source, string Destination);
+
 internal static class MemoryServiceClient
 {
     internal const string PipeName = "MagicCommunityMemory-v1";
@@ -84,6 +87,28 @@ internal static class MemoryServiceClient
                 value.GetProperty("privilegeError").GetUInt32(),
                 value.GetProperty("availableBefore").GetInt64(),
                 value.GetProperty("availableAfter").GetInt64());
+        }
+        catch (JsonException) { return null; }
+        catch (KeyNotFoundException) { return null; }
+    }
+
+    // P4: the service moves one allow-listed shell folder and leaves a junction.
+    internal static FolderMigrateReceipt? MigrateFolder(string folder, string targetRoot, string userProfile)
+    {
+        string? reply = Send("migrate-folder:" + folder + "\0" + targetRoot + "\0" + userProfile, 120000);
+        if (reply is null) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(reply);
+            var value = document.RootElement;
+            return new FolderMigrateReceipt(
+                value.GetProperty("folder").GetString() ?? folder,
+                value.GetProperty("moved").GetBoolean(),
+                value.GetProperty("junctioned").GetBoolean(),
+                value.GetProperty("rolledBack").GetBoolean(),
+                value.GetProperty("win32Error").GetUInt32(),
+                value.GetProperty("source").GetString() ?? "",
+                value.GetProperty("destination").GetString() ?? "");
         }
         catch (JsonException) { return null; }
         catch (KeyNotFoundException) { return null; }

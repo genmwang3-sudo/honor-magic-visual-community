@@ -8,6 +8,7 @@
 #include <string>
 #include <cstdio>
 #include <cstdint>
+#include <vector>
 
 namespace
 {
@@ -254,6 +255,121 @@ std::wstring FormatStop(std::wstring const &name, StopResult const &r)
     return buffer;
 }
 
+bool DirectoryExists(std::wstring const &path)
+{
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+bool PathExists(std::wstring const &path)
+{
+    return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+bool IsReparsePoint(std::wstring const &path)
+{
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+// P4: move one known user directory to another drive and leave a junction.
+// Only the three shell folders below are accepted, and the target must be an
+// existing local directory on a fixed drive. The receipt lists what moved so a
+// caller can roll back.
+constexpr wchar_t const *MigratableFolders[] = {L"Desktop", L"Downloads", L"Documents"};
+
+bool IsMigratable(std::wstring const &name)
+{
+    for (auto const *allowed : MigratableFolders)
+        if (_wcsicmp(name.c_str(), allowed) == 0)
+            return true;
+    return false;
+}
+
+struct MigrateResult
+{
+    DWORD win32Error = 0;
+    bool moved = false;
+    bool junctioned = false;
+    bool rolledBack = false;
+    std::wstring source;
+    std::wstring destination;
+};
+
+MigrateResult MigrateFolder(std::wstring const &name, std::wstring const &targetRoot, std::wstring const &userProfile)
+{
+    MigrateResult result{};
+    if (!IsMigratable(name) || targetRoot.empty())
+    {
+        result.win32Error = ERROR_INVALID_PARAMETER;
+        return result;
+    }
+    result.source = userProfile + L"\\" + name;
+    result.destination = targetRoot + L"\\" + name;
+    bool targetAbsolute = targetRoot.size() > 2 && targetRoot[1] == L':';
+    if (!DirectoryExists(targetRoot) || !targetAbsolute)
+    {
+        result.win32Error = ERROR_PATH_NOT_FOUND;
+        return result;
+    }
+    if (!DirectoryExists(result.source) || IsReparsePoint(result.source))
+    {
+        result.win32Error = ERROR_DIRECTORY;
+        return result;
+    }
+    if (PathExists(result.destination))
+    {
+        result.win32Error = ERROR_ALREADY_EXISTS;
+        return result;
+    }
+    if (!MoveFileExW(result.source.c_str(), result.destination.c_str(), MOVEFILE_COPY_ALLOWED))
+    {
+        result.win32Error = GetLastError();
+        return result;
+    }
+    result.moved = true;
+    std::wstring command = L"cmd.exe /c mklink /J \"" + result.source + L"\" \"" + result.destination + L"\"";
+    STARTUPINFOW startInfo{};
+    startInfo.cb = sizeof(startInfo);
+    PROCESS_INFORMATION processInfo{};
+    std::wstring mutableCommand = command;
+    if (!CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startInfo, &processInfo))
+    {
+        result.win32Error = GetLastError();
+    }
+    else
+    {
+        WaitForSingleObject(processInfo.hProcess, 20000);
+        DWORD exitCode = 1;
+        GetExitCodeProcess(processInfo.hProcess, &exitCode);
+        CloseHandle(processInfo.hProcess);
+        CloseHandle(processInfo.hThread);
+        if (exitCode == 0)
+            result.junctioned = true;
+        else
+            result.win32Error = exitCode;
+    }
+    if (!result.junctioned)
+    {
+        // A failed junction must not leave the folder detached.
+        if (MoveFileExW(result.destination.c_str(), result.source.c_str(), MOVEFILE_COPY_ALLOWED))
+            result.rolledBack = true;
+    }
+    return result;
+}
+
+std::wstring FormatMigrate(std::wstring const &name, MigrateResult const &r)
+{
+    wchar_t buffer[1024]{};
+    swprintf_s(buffer, L"{\"ok\":%s,\"folder\":\"%s\",\"moved\":%s,\"junctioned\":%s,"
+                       L"\"rolledBack\":%s,\"win32Error\":%lu,\"source\":\"%s\",\"destination\":\"%s\"}",
+               (r.junctioned ? L"true" : L"false"), name.c_str(),
+               (r.moved ? L"true" : L"false"), (r.junctioned ? L"true" : L"false"),
+               (r.rolledBack ? L"true" : L"false"), r.win32Error,
+               r.source.c_str(), r.destination.c_str());
+    return buffer;
+}
+
 bool ServeOne(HANDLE pipe)
 {
     if (!SameSession(pipe))
@@ -273,6 +389,44 @@ bool ServeOne(HANDLE pipe)
     {
         std::wstring text = FormatReceipt(Clean());
         response.assign(text.begin(), text.end());
+    }
+    else if (command.find("migrate-folder:") == 0)
+    {
+        // NUL-delimited payload; paths may contain '|' or spaces.
+        std::string payload(command.begin() + 15, command.end());
+        while (!payload.empty() && (payload.back() == '\n' || payload.back() == '\r'))
+            payload.pop_back();
+        std::vector<std::string> parts;
+        size_t start = 0;
+        while (start <= payload.size())
+        {
+            size_t zero = payload.find('\0', start);
+            if (zero == std::string::npos)
+            {
+                parts.push_back(payload.substr(start));
+                break;
+            }
+            parts.push_back(payload.substr(start, zero - start));
+            start = zero + 1;
+        }
+        while (parts.size() < 3)
+            parts.push_back(std::string());
+        auto toWide = [](std::string const &text) {
+            int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), int(text.size()), nullptr, 0);
+            std::wstring value(size_t(size), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, text.c_str(), int(text.size()), value.data(), size);
+            return value;
+        };
+        std::wstring name = toWide(parts[0]);
+        if (!IsMigratable(name))
+        {
+            response = "{\"ok\":false,\"error\":\"folder-not-allowed\"}";
+        }
+        else
+        {
+            std::wstring text = FormatMigrate(name, MigrateFolder(name, toWide(parts[1]), toWide(parts[2])));
+            response.assign(text.begin(), text.end());
+        }
     }
     else if (command.find("stop-service:") == 0)
     {

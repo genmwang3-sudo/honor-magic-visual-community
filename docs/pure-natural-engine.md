@@ -214,3 +214,66 @@ sc.exe sdset MagicAnimationService D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPW
 实测（管理员令牌，两次独立运行）：可用物理内存分别增加 `4490.4 MiB` 与 `3525.0 MiB`，命令 4/2 均返回 `0x00000000`，`privilegeNotHeld=false`。自动调度回执 `enabled=true, systemCleanIntervalMs=900000`，周期 15 分钟。
 
 结论：数值效果可复现，权限架构不等价。要达到官方形态需新增 LocalSystem 服务并在 UI 与服务之间加 IPC，这部分尚未实现。
+
+## LocalSystem 服务层（与官方架构对齐）
+
+社区版新增 `MagicMemoryService.exe`，以 LocalSystem 运行，承接所有需要特权的动作。桌面进程保持普通令牌，通过命名管道请求服务执行。
+
+### 命令集（固定，无通用执行面）
+
+| 命令 | 行为 | 允许列表 |
+| --- | --- | --- |
+| `health` | 返回服务标识与版本 | — |
+| `clean` | 启用两个特权并执行命令 4/2 | — |
+| `stop-service:<name>` | 停止宿主服务 | 仅 `SysMain`、`whesvc` |
+| `migrate-folder:<folder>\0<target>\0<profile>` | 移动目录并建 Junction | 仅 `Desktop`、`Downloads`、`Documents` |
+
+参数使用 NUL 分隔，避免 Windows 路径中的 `|` 或空格破坏解析。
+
+### 安全边界
+
+- 管道 SDDL：`D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`
+- 客户端会话校验：`GetNamedPipeClientProcessId` + `ProcessIdToSessionId`，拒绝会话 0
+- 未知命令、未知服务名、未知目录名一律返回结构化拒绝，不执行
+- Junction 建立失败时自动把目录移回，回执记录 `rolledBack`
+
+### 与官方的对应
+
+| 能力 | 官方 | 社区版 |
+| --- | --- | --- |
+| 特权服务 | `MagicAnimationService`（LocalSystem） | `MagicCommunityMemoryService`（LocalSystem） |
+| 创建方式 | `OpenSCManagerW` + `CreateServiceW` + SDDL | `sc create obj= LocalSystem` + 同构 SDDL |
+| UI 权限 | 普通完整性 | 普通完整性 |
+| 调用通道 | IPC | 命名管道 + 会话校验 |
+| 内核驱动 | `MonProcessControl.sys` | 未实现 |
+| 守护服务 | `GuardService` | 未实现（`MagicDesktopGuard.exe` 非服务） |
+
+### 普通权限实测（`--memory-service-fixture`）
+
+```text
+admin = False
+
+clean:  PurgeStatus=0  EmptyStatus=0  PrivilegeEnabled=true  PrivilegeError=0
+        AvailableDeltaBytes = 770,437,120 ~ 1,276,391,424
+        Effective = true
+
+stop-service: whesvc  RUNNING -> STOPPED  Stopped=true  (已有实例时为 1062 ERROR_SERVICE_ALREADY_STOPPED)
+stop-service: Spooler -> {"ok":false,"error":"service-not-allowed"}
+migrate: Desktop 成功 moved+junctioned；不存在目标 -> win32Error=3
+migrate: Pictures -> {"ok":false,"error":"folder-not-allowed"}
+```
+
+8 项检查全部通过，均在桌面普通令牌下完成，无 UAC。
+
+### 安装与卸载
+
+- 安装器解压后校验 `installed-desktop.json` 全部哈希，不匹配即抛错
+- 安装前先停旧服务并等待进程退出，避免镜像占用导致复制失败
+- 服务随安装自动 `sc create obj= LocalSystem start= auto` 并启动
+- `MagicCommunity-Setup-*.exe --uninstall` 停服务、删除服务、移除安装目录，保留用户数据
+
+### 仍未实现
+
+- 内核驱动等价物（进程创建通知、工作集边界、黑名单终止）
+- 独立 `GuardService`
+- 服务端尚无 P4 回滚命令（回执已记录 `rolledBack`，回滚仍由客户端侧完成）

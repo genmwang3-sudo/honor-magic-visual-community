@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Text.Json;
 
 namespace MagicCommunity;
@@ -18,6 +19,8 @@ internal static class MemoryServiceFixture
         MemoryServiceReceipt? clean = null;
         ServiceStopReceipt? stop = null;
         string? deniedStop = null;
+        bool expectMissingTarget = false;
+        string? migrateRaw = null;
 
         Check("service-detected", () =>
         {
@@ -48,6 +51,26 @@ internal static class MemoryServiceFixture
             deniedStop = MemoryServiceClient.Send("stop-service:Spooler", 8000);
             Expect(deniedStop is not null && deniedStop.Contains("service-not-allowed", StringComparison.Ordinal),
                 "unknown service was not rejected");
+        });
+        Check("migrate-allowlist-rejects-unknown", () =>
+        {
+            var denied = MemoryServiceClient.Send("migrate-folder:Pictures|D:\\|C:\\Users", 8000);
+            Expect(denied is not null && denied.Contains("folder-not-allowed", StringComparison.Ordinal),
+                "unknown folder was not rejected");
+        });
+        Check("migrate-rejects-missing-target", () =>
+        {
+            string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            // A missing target must be refused by the service with a Win32 code,
+            // which arrives as a structured negative receipt rather than null.
+            string? raw = MemoryServiceClient.Send(
+                "migrate-folder:Desktop\0" + Path.Combine(Path.GetTempPath(), "magic-no-such-target-" + Guid.NewGuid().ToString("N")) + "\0" + profile,
+                15000);
+            Expect(raw is not null, "migrate returned nothing");
+            expectMissingTarget = raw!.Contains("\"junctioned\":false", StringComparison.Ordinal) &&
+                                  !raw.Contains("\"win32Error\":0", StringComparison.Ordinal);
+            Expect(expectMissingTarget, "missing target was not rejected: " + raw);
+            migrateRaw = raw;
         });
         Check("stop-service-reports-state", () =>
         {
@@ -82,6 +105,8 @@ internal static class MemoryServiceFixture
                 ? new { s.Name, before = s.BeforeText, after = s.AfterText, s.Win32Error, s.Stopped }
                 : null,
             stopDenied = deniedStop,
+            migrateRejectsMissingTarget = expectMissingTarget,
+            migrateRaw,
             scope = "Desktop-token calls only; service performs privileged work."
         };
     }
