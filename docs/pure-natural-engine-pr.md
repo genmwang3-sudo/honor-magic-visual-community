@@ -120,3 +120,60 @@ git -c core.whitespace=cr-at-eol diff --check
 - `b93e766 feat(memory): port pure natural memory governance`（17 files, +1901 / -6）
 - 父提交 `6688b3b chore: refresh public update manifest`
 - 远端 `origin/main` = `b93e766`
+
+
+---
+
+## 更新（调度补齐与 P3/P4 可执行化）
+
+后续提交 `5d8fc30 feat(memory): schedule memory clean and execute service and migration controls` 关闭了此前的两个缺口。
+
+### 官方调度取证
+
+| 能力 | 官方自动定时 | 证据 |
+| --- | --- | --- |
+| P0 工作集裁剪 | 有 | `StartupWorkingSetTrimDelays` + `DispatcherTimer` 5 分钟 + `_interactionTrimTimer` |
+| P1 系统内存列表清理 | 未发现独立定时器 | `MemoryManager::ClearMemory` 为一次 CleanMode 动作 |
+| P2 进程冻结 | 未发现独立定时器 | `SuspendPidList`/`EnumIconicAndVisiblePid` 枚举驱动 |
+| P3 停服务 | 执行，非定时 | `ServiceManagerCfg.dat` XOR 0x80 → `SysMain`/`whesvc` stopped |
+| P4 目录迁移 | 执行，非定时 | `DiskManager` 的 `CreateJunction`/`HandleBatchMoveAction` |
+
+结论：官方只对 P0 做了自动定时；P1/P2 是一次性动作。社区版按需求在 P1/P2 上补了显式定时器，默认关闭。
+
+### 新增模块
+
+- `PureNaturalNative.cs`：唯一持有两个特权、`NtSetSystemInformation`、`NtSuspendProcess`/`NtResumeProcess`、自带子进程枚举的深模块；诊断与调度共用，杜绝行为分叉。
+- `PureNaturalScheduler.cs`：P1/P2 定时器。`systemCleanIntervalMs` 默认 30 分钟（1 分钟–24 小时），`ownedFreezeIntervalMs` 默认 10 分钟；`freezePids` 只作为自有子进程的子集筛选；`Dispose` 恢复全部冻结进程；`MAGICCOMMUNITY_DISABLE_PURE_NATURAL_SCHEDULE=1` 可整体关闭。
+- `PureNaturalOperations.cs`：P3/P4 执行器。`IPureNaturalActions` 缝隙 + Windows 适配器；dry-run 默认，`mode=apply` 才执行；Junction 失败自动移回；回执含 before/after 与 rollback 条目；`Rollback` 恢复服务、删 Junction、移回目录。
+- `PureNaturalOperationsTests.cs` / `PureNaturalSchedulerTests.cs`：10 + 7 项隔离测试（注入时钟与 fake 适配器，无真实服务/目录动作）。
+- `PureNaturalMigrationFixture.cs`：真实文件系统验证 P4（隔离 artifacts 目录，不碰用户 profile）。
+- `PureNaturalServiceFixture.cs`：真实服务只读查询 + 非管理员停服务拒绝路径验证。
+
+### 新增 CLI
+
+```text
+--pure-natural-operations-test     隔离 P3/P4 适配器测试
+--pure-natural-schedule-test       隔离调度测试
+--pure-natural-migration-fixture   真实文件系统迁移/回滚夹具
+--pure-natural-service-fixture     真实服务状态与拒绝路径夹具
+--pure-natural-apply               需 mode=apply，执行服务停启与目录迁移
+--pure-natural-rollback --receipt  按回执回滚
+```
+
+### 新增验证
+
+| 项 | 结果 |
+| --- | --- |
+| `check-worktree.ps1` | `exitCode=0`，12 项测试全部 `allPass=true` |
+| P4 真实夹具 | `movedExists` / `junctionIsLink` / `readableThroughJunction` / `restored` / `targetCleared` 全部 true |
+| P3 非管理员 | `whesvc` `Changed=false`、before/after `RUNNING`、`ExitCode=5`，结构化拒绝而非异常 |
+| 诊断复用原生模块 | `--pure-natural-runtime-test` `allPass=true`，P0/P2 有效，P1 中完整性仍 `0xC0000061` |
+| `diff --check` | `exitCode=0` |
+| 推送 | `c299fc5..5d8fc30`，`PUSH_EXIT=0`，远端 `main` = `5d8fc30` |
+
+### 仍然保留的边界
+
+- P1 在普通权限下返回 `STATUS_PRIVILEGE_NOT_HELD`；P3 停服务需要管理员令牌。两者都不隐式提权。
+- P2 只冻结本进程的直接子进程，永不接受任意进程名。
+- P4 只迁移策略里列出的已知目录，需要显式 `migrationTargetRoot`；默认 dry-run。
+- 内核驱动（`MonProcessControl.sys` 等价物）与第三方进程黑名单/终止仍未实现；官方这部分是独立签名驱动。
