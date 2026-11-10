@@ -54,6 +54,31 @@ Install the Windows Driver Kit for this SDK version before building the driver.
 
 第 3 步在启用了 Secure Boot 的机器上无法用自签名绕过，这是 Windows 的强制策略，不是实现缺陷。
 
+## 用户态客户端（已实现并验证）
+
+`src/MagicCommunity/ProcessGuardClient.cs` 通过 `\\.\MagicProcessGuard` 下发 IOCTL。
+
+关键设计：**驱动是可选的**。设备不存在时，所有调用返回 `false` 并附带 `win32Error`，不抛异常，桌面功能不受影响。
+
+`--process-guard-fixture` 实测（本机无驱动）：
+
+```text
+allPass = true
+driverAvailable = false
+setWorkingSet   -> ok=false win32Error=2  (ERROR_FILE_NOT_FOUND)
+addBlacklist    -> ok=false win32Error=2
+removeBlacklist -> ok=false win32Error=2
+state           -> null
+
+checks:
+  client-never-throws-when-absent
+  availability-matches-device
+  invalid-arguments-rejected-before-ioctl
+  driver-absent-is-a-structured-skip
+```
+
+参数校验在 IOCTL 之前完成：PID 必须为正、上下界不能为 0、上界不得小于下界、镜像名非空且小于 260 字符。
+
 ## 与官方的对照
 
 | 能力 | 官方 `MonProcessControl.sys` | 本驱动 |
