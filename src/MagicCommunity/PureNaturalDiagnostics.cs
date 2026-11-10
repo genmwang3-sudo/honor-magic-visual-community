@@ -19,7 +19,6 @@ internal static class PureNaturalDiagnostics
     private const int SystemMemoryListInformation = 80;
     private const int MemoryPurgeStandbyList = 4;
     private const int MemoryEmptyWorkingSets = 2;
-    private static readonly int StatusPrivilegeNotHeld = unchecked((int)0xC0000061);
     private const uint TokenQuery = 0x0008;
     private const uint TokenAdjustPrivileges = 0x0020;
     private const uint SePrivilegeEnabled = 0x00000002;
@@ -117,49 +116,23 @@ internal static class PureNaturalDiagnostics
         return new Counters(true, value.PageFaultCount, (long)value.PrivateUsage, (long)value.WorkingSetSize);
     }
 
+    // Delegates to the shared native module so scheduling and diagnostics cannot
+    // diverge on privileges, command order or NTSTATUS handling.
     private static SystemCleanObservation CleanSystemMemoryLists()
     {
-        var privileges = new List<object>();
-        using var process = Process.GetCurrentProcess();
-        if (!OpenProcessToken(process.Handle, TokenQuery | TokenAdjustPrivileges, out IntPtr token))
+        var clean = PureNaturalNative.Clean();
+        var privileges = clean.Privileges.Select(state => (object)new
         {
-            int tokenError = Marshal.GetLastWin32Error();
-            return new SystemCleanObservation(false, "open-token-failed", privileges, ReadSystemMemory(), ReadSystemMemory(),
-                0, Hex(tokenError), Hex(tokenError), false, false);
-        }
-        try
-        {
-            foreach (string name in new[] { "SeIncreaseQuotaPrivilege", "SeProfileSingleProcessPrivilege" })
-            {
-                var enabled = EnablePrivilege(token, name);
-                privileges.Add(new { name, enabled.Held, enabled.Error, status = enabled.Error == 0 ? "ok" : "win32-error" });
-            }
-        }
-        finally
-        {
-            CloseHandle(token);
-        }
-        var before = ReadSystemMemory();
-        int purge = MemoryPurgeStandbyList;
-        int purgeStatus = NtSetSystemInformation(SystemMemoryListInformation, ref purge, sizeof(int));
-        int empty = MemoryEmptyWorkingSets;
-        int emptyStatus = NtSetSystemInformation(SystemMemoryListInformation, ref empty, sizeof(int));
-        Thread.Sleep(500);
-        var after = ReadSystemMemory();
-        long delta = after.AvailablePhysicalBytes - before.AvailablePhysicalBytes;
-        bool privilegeNotHeld = purgeStatus == StatusPrivilegeNotHeld || emptyStatus == StatusPrivilegeNotHeld;
-        return new SystemCleanObservation(true, "executed", privileges, before, after, delta,
-            Hex(purgeStatus), Hex(emptyStatus), privilegeNotHeld,
-            purgeStatus == 0 || emptyStatus == 0);
-    }
-
-    private static (bool Held, int Error) EnablePrivilege(IntPtr token, string name)
-    {
-        if (!LookupPrivilegeValueW(null, name, out Luid luid)) return (false, Marshal.GetLastWin32Error());
-        var state = new TokenPrivileges { Count = 1, Luid = luid, Attributes = SePrivilegeEnabled };
-        bool adjusted = AdjustTokenPrivileges(token, false, ref state, (uint)Marshal.SizeOf<TokenPrivileges>(), IntPtr.Zero, out _);
-        int error = Marshal.GetLastWin32Error();
-        return (adjusted && error != 1300, adjusted && error == 1300 ? error : adjusted ? 0 : error);
+            name = state.Name,
+            enabled = state.Held,
+            status = state.Error == 0 ? "ok" : "win32-error"
+        }).ToArray();
+        return new SystemCleanObservation(clean.Executed, clean.Effective ? "ok" : "completed-with-status",
+            privileges,
+            new MemorySample(clean.Before.TotalBytes, clean.Before.AvailableBytes),
+            new MemorySample(clean.After.TotalBytes, clean.After.AvailableBytes),
+            clean.AvailableDeltaBytes, Hex(clean.PurgeStatus), Hex(clean.EmptyWorkingSetsStatus),
+            clean.PrivilegeNotHeld, clean.Effective);
     }
 
     private static DirectFreezeObservation ExerciseOwnedProcessFreeze()
@@ -465,7 +438,7 @@ internal static class PureNaturalDiagnostics
         long WorkingSetAfterBytes, long WorkingSetDeltaBytes, long PrivateBeforeBytes, long PrivateAfterBytes,
         long PageFaultsBefore, long PageFaultsAfter, long PrivateUsageBefore, long PrivateUsageAfter);
     private sealed record SystemCleanObservation(bool Executed, string Result, IReadOnlyList<object> Privileges,
-        MemorySnapshot Before, MemorySnapshot After, long AvailableDeltaBytes, string PurgeStatus, string EmptyWorkingSetsStatus,
+        MemorySample Before, MemorySample After, long AvailableDeltaBytes, string PurgeStatus, string EmptyWorkingSetsStatus,
         bool PrivilegeNotHeld, bool Effective);
     private sealed record DirectFreezeObservation(bool FreezeSucceeded, bool ResumeSucceeded, string Mode,
         int SuspendStatus, int StateStatus, int ResumeStatus, double CpuDeltaDuringFreezeMs, bool ChildAliveAfterResume,

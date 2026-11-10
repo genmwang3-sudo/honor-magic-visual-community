@@ -4,8 +4,8 @@ using System.Text.Json;
 
 namespace MagicCommunity;
 
-// P1/P2/P3/P4 policy. All active controls are opt-in; the policy module is a
-// configuration and dry-run seam. It never executes service or file actions.
+// P1/P2/P3/P4 policy. Automatic controls stay opt-in; P3/P4 execute only when
+// the caller also selects mode=apply, so a loaded policy never mutates the host.
 internal sealed class PureNaturalPolicy
 {
     public bool SystemMemoryClean { get; set; } = false;
@@ -13,8 +13,13 @@ internal sealed class PureNaturalPolicy
     public bool ServiceControls { get; set; } = false;
     public bool DiskMigration { get; set; } = false;
     public string Mode { get; set; } = "dry-run";
+    public int SystemCleanIntervalMs { get; set; } = 1_800_000;
+    public int OwnedFreezeIntervalMs { get; set; } = 600_000;
+    public int OwnedFreezeIdleMs { get; set; } = 120_000;
+    public int[] FreezePids { get; set; } = [];
     public string[] ServiceNames { get; set; } = ["SysMain", "whesvc"];
     public string[] MigrationCandidates { get; set; } = ["Desktop", "Downloads", "Documents"];
+    public string? MigrationTargetRoot { get; set; }
     public int FreezeIdleMs { get; set; } = 120_000;
     public long FreezeWorkingSetBytes { get; set; } = 96L * 1024 * 1024;
 }
@@ -32,7 +37,8 @@ internal static class PureNaturalConfig
     private static readonly string[] Allowed =
     [
         "systemMemoryClean", "ownedProcessFreeze", "serviceControls", "diskMigration", "mode",
-        "serviceNames", "migrationCandidates", "freezeIdleMs", "freezeWorkingSetBytes"
+        "systemCleanIntervalMs", "ownedFreezeIntervalMs", "ownedFreezeIdleMs", "freezePids",
+        "serviceNames", "migrationCandidates", "migrationTargetRoot", "freezeIdleMs", "freezeWorkingSetBytes"
     ];
 
     internal static string PathOf(string root) => Path.Combine(root, "data", FileName);
@@ -66,6 +72,17 @@ internal static class PureNaturalConfig
         if (policy.FreezeIdleMs is < 1000 or > 3_600_000) throw new InvalidDataException("Freeze idle bound exceeded.");
         if (policy.FreezeWorkingSetBytes is < 16L * 1024 * 1024 or > 1024L * 1024 * 1024)
             throw new InvalidDataException("Freeze working-set bound exceeded.");
+        if (policy.SystemCleanIntervalMs is < 60_000 or > 24 * 60 * 60 * 1000)
+            throw new InvalidDataException("System clean interval bound exceeded.");
+        if (policy.OwnedFreezeIntervalMs is < 60_000 or > 24 * 60 * 60 * 1000)
+            throw new InvalidDataException("Owned freeze interval bound exceeded.");
+        if (policy.OwnedFreezeIdleMs is < 1_000 or > 24 * 60 * 60 * 1000)
+            throw new InvalidDataException("Owned freeze idle bound exceeded.");
+        if (policy.FreezePids is null || policy.FreezePids.Length > 16 || policy.FreezePids.Any(pid => pid <= 0))
+            throw new InvalidDataException("Invalid freeze pid list.");
+        if (policy.MigrationTargetRoot is { Length: > 0 } target &&
+            (!Path.IsPathFullyQualified(target) || target.Length > 260 || target.Contains("..")))
+            throw new InvalidDataException("Invalid migration target root.");
         ValidateNames(policy.ServiceNames, 16, 64, "service");
         ValidateNames(policy.MigrationCandidates, 16, 64, "migration candidate");
     }
@@ -78,33 +95,54 @@ internal static class PureNaturalConfig
                 throw new InvalidDataException("Invalid " + label + " name.");
     }
 
-    // P3/P4 planning is pure data. The returned plan never starts, stops,
-    // migrates or deletes anything; apply mode is consumed by an explicit caller.
+    // Planning is pure data: it reports what apply would do without doing it.
     internal static object Plan(string root, PureNaturalPolicy policy)
     {
         Validate(policy);
-        bool execute = policy.Mode == "apply" && (policy.ServiceControls || policy.DiskMigration);
+        bool execute = policy.Mode == "apply";
         return new
         {
             protocol = "Magic.PureNatural.Policy/1",
             root,
             mode = policy.Mode,
             execute,
-            p1 = new { policy.SystemMemoryClean, operation = "memory-clean", commands = new[] { 4, 2 }, informationClass = 80 },
-            p2 = new { policy.OwnedProcessFreeze, policy.FreezeIdleMs, policy.FreezeWorkingSetBytes, operation = "process-freeze", identity = "owned-child-pid+image+created" },
+            p1 = new
+            {
+                enabled = policy.SystemMemoryClean,
+                automaticIntervalMs = policy.SystemCleanIntervalMs,
+                operation = "memory-clean",
+                commands = new[] { 4, 2 },
+                informationClass = 80
+            },
+            p2 = new
+            {
+                enabled = policy.OwnedProcessFreeze,
+                automaticIntervalMs = policy.OwnedFreezeIntervalMs,
+                policy.OwnedFreezeIdleMs,
+                explicitPids = policy.FreezePids,
+                policy.FreezeWorkingSetBytes,
+                operation = "process-freeze",
+                identity = "owned-child-pid+image+created"
+            },
             p3 = new
             {
-                policy.ServiceControls,
-                operation = "service-control-readonly",
-                services = policy.ServiceNames.Select(name => new { name, desiredState = "stopped", action = execute ? "apply" : "read-only" }).ToArray()
+                enabled = policy.ServiceControls,
+                operation = "service-control",
+                services = policy.ServiceNames.Select(name => new { name, desiredState = "stopped", action = execute ? "apply" : "plan-only" }).ToArray()
             },
             p4 = new
             {
-                policy.DiskMigration,
-                operation = "disk-migration-plan",
-                candidates = policy.MigrationCandidates.Select(name => new { name, steps = new[] { "scan", "select-target", "move", "junction", "icon", "rollback-receipt" }, action = execute ? "apply" : "plan-only" }).ToArray()
+                enabled = policy.DiskMigration,
+                operation = "disk-migration",
+                targetRoot = policy.MigrationTargetRoot,
+                candidates = policy.MigrationCandidates.Select(name => new
+                {
+                    name,
+                    steps = new[] { "scan", "select-target", "move", "junction", "icon", "rollback-receipt" },
+                    action = execute ? "apply" : "plan-only"
+                }).ToArray()
             },
-            scope = "Configuration and dry-run plan; no system service, third-party process, driver or user file is changed by Plan()."
+            scope = "Configuration and plan only; no service, driver, third-party process or user file is changed by Plan()."
         };
     }
 }

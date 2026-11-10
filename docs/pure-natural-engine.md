@@ -147,3 +147,42 @@ pwsh -NoProfile -File tools/dev/run-pure-natural-elevated.ps1 -NativeBackend art
 - 不同 Windows 11 build 上 `NtCreateProcessStateChange` ABI 的稳定性；本机已实测 state-change 与 `NtSuspendProcess` fallback 两条路径。
 - live desktop 长时 A/B、冷启动时间、软缺页回读和实际续航影响；P0 回执中 `PageFaultCount` 已增加，说明工作集裁剪可能带来后续磁盘/软缺页代价。
 - P3/P4 apply 路径的真实服务停启与目录迁移；当前只验证 dry-run、配置边界和执行计划，默认不会对用户环境执行这些动作。
+
+## 官方调度证据与本轮补齐
+
+官方样本的自动调度范围比宣传小，静态证据如下：
+
+| 能力 | 官方自动定时 | 证据 |
+| --- | --- | --- |
+| P0 自有进程工作集裁剪 | 有 | `StartupWorkingSetTrimDelays` 8/12/20/30/45/120s、`DispatcherTimer` 每 5 分钟、`_interactionTrimTimer`、`ScheduleWorkingSetTrimming` |
+| P1 系统内存列表清理 | 无独立定时器证据 | `MemoryManager::ClearMemory` 为可调用方法；日志 `ram clear, stop service/clear process/clear memory` 属一次 CleanMode 三段式动作 |
+| P2 进程冻结 | 无独立定时器证据 | `SuspendPidList` + `EnumIconicAndVisiblePid` 为枚举驱动；`Sleep`/`OpenEventW`/`SetEvent` 见于导入表，未定位独立调度器 |
+| P3 停服务 | 执行，非定时 | `ServiceManagerCfg.dat` XOR 0x80 得 `SysMain`/`whesvc` `dstStatus="stopped"` |
+| P4 目录迁移 | 执行，非定时 | `DiskManager` 含 `CreateJunction`/`SetFolderIcon`/`DenyDeletePermission`/`HandleBatchMoveAction`/`FindSuitableDiskForMigration` |
+
+社区版在官方只有一次性动作的地方补了显式定时器（`PureNaturalScheduler`），默认关闭，需要用户在 `data/pure-natural.json` 中开启：
+
+- `systemMemoryClean` + `systemCleanIntervalMs`（默认 30 分钟，范围 1 分钟–24 小时）
+- `ownedProcessFreeze` + `ownedFreezeIntervalMs`（默认 10 分钟）、`freezePids`（仅从自有子进程集合中筛选）
+
+调度器与诊断共用 `PureNaturalNative` 原生原语，避免特权与 NTSTATUS 处理分叉；`Dispose` 时恢复全部被冻结的自有子进程。环境变量 `MAGICCOMMUNITY_DISABLE_PURE_NATURAL_SCHEDULE=1` 可整体关闭。
+
+## P3/P4 可执行实现
+
+`PureNaturalOperations` 提供 `Apply` / `ApplyWithHome` / `Rollback`，通过 `IPureNaturalActions` 缝隙隔离 Windows 适配器：
+
+- 默认 `mode=dry-run`：只返回计划，不调用适配器。
+- `mode=apply` 且 `serviceControls=true`：`sc.exe query/stop/query` 记录 before/after；单个服务失败不中断后续。
+- `mode=apply` 且 `diskMigration=true` 且提供 `migrationTargetRoot`：`Directory.Move` → `mklink /J` → 写回滚回执；Junction 失败立即把目录移回原路径。
+- 拒绝目标已存在、源为重解析点、目标根不存在。
+- `Rollback` 读取回执：重启服务、删除 Junction、把目录移回。
+
+实测（本机非管理员）：
+
+| 验证 | 结果 |
+| --- | --- |
+| P4 真实文件系统夹具 | `movedExists=true`、`junctionIsLink=true`、`readableThroughJunction=true`、`restored=true`、`targetCleared=true` |
+| P3 非管理员停服务 | `whesvc` `Changed=false`、before/after 均 `RUNNING`、`ExitCode=5`（拒绝），回执保留 |
+| `check-worktree.ps1` | `exitCode=0`，12 项测试全部 `allPass=true` |
+
+P3 的停服务需要管理员令牌；非管理员下按设计返回结构化拒绝，不做隐式提权。
