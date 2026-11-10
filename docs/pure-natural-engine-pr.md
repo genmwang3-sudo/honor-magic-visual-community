@@ -261,3 +261,64 @@ sc.exe sdset MagicAnimationService D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)
 - P2 只冻结本进程的直接子进程，永不接受任意进程名。
 - P4 只迁移策略里列出的已知目录，需要显式 `migrationTargetRoot`；默认 dry-run。
 - 内核驱动（`MonProcessControl.sys` 等价物）与第三方进程黑名单/终止仍未实现；官方这部分是独立签名驱动。
+
+---
+
+## 内核驱动（源码，未构建）
+
+`MonProcessControl.sys` 的社区对应实现已提交源码，但**没有二进制产物**。
+
+### 本机缺少 WDK
+
+| 依赖 | 状态 |
+| --- | --- |
+| `Include/10.0.26100.0/km` | 不存在 |
+| `km/wdm.h` | 不存在 |
+| `Inf2Cat.exe` / `stampinf.exe` | 不存在 |
+
+只有用户态 SDK 的 `shared / ucrt / um / winrt / cppwinrt`。`tools/dev/build-process-guard.ps1` 会在构建前检查并抛错，不产出未校验的 `.sys`。
+
+### 驱动接口
+
+设备 `\Device\MagicProcessGuard`，四个 IOCTL：
+
+```text
+IOCTL_MAGIC_SET_WORKINGSET     对指定 PID 设置工作集上下界
+IOCTL_MAGIC_ADD_BLACKLIST      加入镜像名黑名单（上限 32）
+IOCTL_MAGIC_REMOVE_BLACKLIST   移出黑名单
+IOCTL_MAGIC_QUERY_STATE        查询条目数与最近拦截 PID
+```
+
+创建通知用 `PsSetCreateProcessNotifyRoutineEx`，命中黑名单时置 `CreationStatus = STATUS_ACCESS_DENIED`（拒绝创建而非事后终止，避免竞态）。
+
+### 未验证项
+
+- `ZwSetInformationProcess(ProcessWorkingSetWatch)` 的上下界语义未复核，不声称工作集限制已生效
+- 黑名单只匹配文件名，不校验完整路径与签名
+- 生产环境需 EV 证书 + Microsoft attestation；Secure Boot 下自签名无法绕过
+
+### 与官方对照
+
+| 能力 | 官方 | 本驱动 |
+| --- | --- | --- |
+| 工作集边界 | 已实现并有 `Set WS OK` 日志 | 调用已写，未验证生效 |
+| 创建通知 | `PsSetCreateProcessNotifyRoutineEx` | 已实现 |
+| 黑名单 | IOCTL 增删 + 内核终止 | 增删已实现，改为拒绝创建 |
+| 终止进程 | `ZwTerminateProcess` | 未实现 |
+| 签名 | 厂商 EV 证书 | 无 |
+
+源码层面可对照，运行行为未经验证。
+
+## 提交记录
+
+```text
+a0dab69 feat(driver): add process guard driver source and WDK-gated build script
+b697f6b chore(launcher): ship elevated launcher alongside the normal entry
+e385642 feat(memory): add folder migration and uninstall to the LocalSystem service
+23f6978 chore(repo): add appearance gallery check stubs so the composition renderer builds
+641d67c feat(memory): add LocalSystem memory service for privileged clean and service control
+10580f7 docs(memory): record official elevation architecture and measured P1 gains
+55d785b feat(installer): add single-file setup executable and fix launcher quoting
+```
+
+远端 `origin/main` = `a0dab6998388386f3a4ab5905b6b0c9c67feb3fc`。
